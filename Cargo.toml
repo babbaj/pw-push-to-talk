@@ -1,0 +1,19 @@
+[package]
+name = "pw_push_to_talk"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+pipewire = "0.6"
+pipewire-sys = "0.6.0"
+libspa = "0.6.0"
+libspa-sys = "0.6.0"
+rdev = "0.5.2"
+clap = "4.1.6"
+#x11 = "2.21.0"
+
+[dependencies.x11]
+version = "2.21.0"
+features = ["xlib"]
