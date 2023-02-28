@@ -1,5 +1,4 @@
 use rdev::Key;
-use std::os::raw::c_uint;
 
 // i hate rdev
 

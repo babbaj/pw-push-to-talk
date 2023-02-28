@@ -1,38 +1,25 @@
 mod keycodes;
 
-use std::{cell::Cell, ptr, rc::Rc};
-use std::cell::{RefCell, UnsafeCell};
+use std::{cell::Cell, rc::Rc};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::io::Cursor;
-use std::process::exit;
-use std::ptr::NonNull;
 
 use pipewire as pw;
-use pipewire::{Core, MainLoop, Properties, spa};
+use pipewire::{Core, MainLoop, spa};
 use pipewire::registry::{GlobalObject, Registry};
-use pipewire::spa::{Direction, ForeignDict};
+use pipewire::spa::{ForeignDict};
 use pw::prelude::*;
 use pw::types::ObjectType;
 use pipewire_sys as sys;
-use sys::pw_node_methods;
 // stupid macro
 use libspa_sys as spa_sys;
 
-use clap::{Arg, arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use libspa::pod::{Object, Property, PropertyFlags, Value};
 use libspa::pod::serialize::PodSerializer;
-use libspa_sys::{spa_debug_type_find, spa_pod_builder, spa_type_param};
 use pipewire::proxy::ProxyT;
-use pipewire_sys::pw_node_events;
 use rdev::{listen, Event, Key};
 
-
-#[derive(Debug)]
-struct PwNode {
-    id: u32,
-    proxy: pw::node::Node
-}
 
 fn parse_args() -> ArgMatches {
     let command = Command::new("multi_sink_source")
@@ -129,11 +116,11 @@ fn extend_lifetime<T>(x: &T) -> &'static T {
 }
 
 // requires call to do_roundtrip
-fn set_mute(node: &PwNode, mute: bool) {
+fn set_mute(node: &pw::node::Node, mute: bool) {
     unsafe {
         let pod = if mute { &MUTE_POD } else { &UNMUTE_POD };
 
-        let ptr: &*mut sys::pw_proxy = std::mem::transmute(node.proxy.upcast_ref());
+        let ptr: &*mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
         spa::spa_interface_call_method!(
             *ptr,
             sys::pw_node_methods,
@@ -145,19 +132,15 @@ fn set_mute(node: &PwNode, mute: bool) {
     }
 }
 
-fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, args: &[(&str, Key)]) -> HashMap<String, PwNode> {
-    let mut out = HashMap::<String, PwNode>::new();
+fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, args: &[(&str, Key)]) -> HashMap<String, pw::node::Node> {
+    let mut out = HashMap::<String, pw::node::Node>::new();
     for_each_object(registry, core, mainloop, |global| {
         if global.props.is_none() { return false }
         let props = global.props.as_ref().unwrap();
         if global.type_ == ObjectType::Node {
             if let Some(name) = props.get("node.name") {
                 if args.iter().any(|(x, _)| *x == name) {
-                    let node = PwNode {
-                        id: global.id,
-                        proxy: registry.bind(global).unwrap()
-                    };
-                    out.insert(name.to_owned(), node);
+                    out.insert(name.to_owned(), registry.bind(global).unwrap());
                 }
             }
         }
@@ -168,11 +151,11 @@ fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, args: &[(&st
     out
 }
 
-fn for_each_object<F: FnMut(&GlobalObject<ForeignDict>) -> bool>(registry: &Registry, core: &Core, mainloop: &MainLoop, mut callback: F) {
+fn for_each_object<F: FnMut(&GlobalObject<ForeignDict>) -> bool>(registry: &Registry, core: &Core, mainloop: &MainLoop, callback: F) {
     let mainloop_clone = mainloop.clone();
     // the listener gets removed at the end of the function
     let callback_ref: *mut () = unsafe { std::mem::transmute(&callback) };
-    let reg_listener = registry
+    let _reg_listener = registry
         .add_listener_local()
         .global(move |global| unsafe {
             let troll: &mut F = std::mem::transmute(callback_ref);
