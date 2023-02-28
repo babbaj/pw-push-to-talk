@@ -1,7 +1,6 @@
 mod keycodes;
 
 use std::{cell::Cell, rc::Rc};
-use std::collections::HashMap;
 use std::io::Cursor;
 
 use pipewire as pw;
@@ -82,11 +81,8 @@ fn main() {
         .expect("Failed to connect to PipeWire Core");
     let registry = core.get_registry().expect("Failed to get Registry");
 
-    let nodes = get_nodes(&registry, &core, &mainloop, &pairs[..]);
-    println!("{:?}", nodes);
-
-    let key_node = pairs.iter().map(|(name, key)| (*key, extend_lifetime(&nodes).get(*name).unwrap()))
-        .collect::<Vec<_>>();
+    let node_key = get_nodes(&registry, &core, &mainloop, &pairs[..]);
+    println!("{:?}", node_key);
 
     // moving is a bit unnecessary but rust is 1984
     let callback = move |event: Event| {
@@ -96,9 +92,9 @@ fn main() {
             _ => return
         };
         let mut change = false;
-        for (k, node) in &key_node {
+        for (node, k) in &node_key {
             if *k == key {
-                set_mute(*node, mute);
+                set_mute(node, mute);
                 change = true;
             }
         }
@@ -109,10 +105,6 @@ fn main() {
     if let Err(error) = listen(callback) {
         panic!("{:?}", error);
     }
-}
-
-fn extend_lifetime<T>(x: &T) -> &'static T {
-    unsafe { std::mem::transmute(x) }
 }
 
 // requires call to do_roundtrip
@@ -132,20 +124,21 @@ fn set_mute(node: &pw::node::Node, mute: bool) {
     }
 }
 
-fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, args: &[(&str, Key)]) -> HashMap<String, pw::node::Node> {
-    let mut out = HashMap::<String, pw::node::Node>::new();
+fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[(&str, Key)]) -> Vec<(pw::node::Node, Key)> {
+    let mut out = Vec::new();
     for_each_object(registry, core, mainloop, |global| {
         if global.props.is_none() { return false }
         let props = global.props.as_ref().unwrap();
         if global.type_ == ObjectType::Node {
             if let Some(name) = props.get("node.name") {
-                if args.iter().any(|(x, _)| *x == name) {
-                    out.insert(name.to_owned(), registry.bind(global).unwrap());
+                if let Some((_, key)) = name_key.iter().find(|(name_in, _)| name == *name_in) {
+                    let proxy = registry.bind(global).unwrap();
+                    out.push((proxy, *key))
                 }
             }
         }
         // exit early if we found our nodes
-        out.len() >= args.len()
+        out.len() >= name_key.len()
     });
 
     out
