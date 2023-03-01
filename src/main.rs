@@ -1,6 +1,7 @@
-mod keycodes;
+extern crate core;
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, ptr, rc::Rc};
+use std::ffi::{c_char, c_int, c_uchar, c_ulong, CString};
 use std::io::Cursor;
 
 use pipewire as pw;
@@ -17,15 +18,118 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use libspa::pod::{Object, Property, PropertyFlags, Value};
 use libspa::pod::serialize::PodSerializer;
 use pipewire::proxy::ProxyT;
-use rdev::{listen, Event, Key};
 
+use x11::xlib;
+use x11::xinput2;
+
+struct KeyboardListener {
+    display: *mut xlib::Display,
+    window: c_ulong,
+    xi_opcode: c_int
+}
+
+// keysym
+enum KeyEvent {
+    Press(c_ulong),
+    Release(c_ulong)
+}
+
+impl KeyboardListener {
+    fn next_event(&self) -> KeyEvent {
+        unsafe {
+            loop {
+                let mut event: xlib::XEvent = std::mem::zeroed();
+                xlib::XNextEvent(self.display, &mut event as *mut _);
+                let cookie = &mut event.generic_event_cookie;
+
+                if xlib::XGetEventData(self.display, cookie as *mut _) != 0
+                    && cookie.type_ == xlib::GenericEvent
+                    && cookie.extension == self.xi_opcode
+                {
+                    // should always be true
+                    if cookie.evtype == xinput2::XI_KeyPress || cookie.evtype == xinput2::XI_KeyRelease {
+                        let event = &*(cookie.data as *const xinput2::XIDeviceEvent);
+                        let repeat = event.flags & xinput2::XIKeyRepeat != 0;
+                        if repeat { continue }
+                        let keycode = event.detail;
+
+                        let keysym = xlib::XKeycodeToKeysym(self.display, keycode as c_uchar, 0);
+
+                        return if cookie.evtype == xinput2::XI_KeyPress {
+                            KeyEvent::Press(keysym)
+                        } else {
+                            KeyEvent::Release(keysym)
+                        }
+                    }
+
+                    xlib::XFreeEventData(self.display, cookie as *mut _)
+                }
+            }
+        }
+    }
+}
+
+impl Drop for KeyboardListener {
+    fn drop(&mut self) {
+        unsafe {
+            xlib::XDestroyWindow(self.display, self.window);
+            xlib::XCloseDisplay(self.display);
+        }
+    }
+}
+
+
+fn setup_keyboard_listener() -> KeyboardListener {
+    unsafe {
+        let display = xlib::XOpenDisplay(ptr::null());
+        // https://github.com/freedesktop/xorg-xinput/blob/8cebd89a644545c91a3d1c146977fe023798ee2a/src/xinput.c#L415
+        let mut xi_opcode: c_int = 0;
+        // don't need these
+        let mut _event: c_int = 0;
+        let mut _error: c_int = 0;
+        if xlib::XQueryExtension(display, "XInputExtension\0".as_ptr() as *const c_char, &mut xi_opcode as *mut _, &mut _event as *mut _, &mut _error as *mut _) == 0 {
+            panic!("X Input extension not available")
+        }
+
+        let win = xlib::XDefaultRootWindow(display);
+        let mask_len = (xinput2::XI_LASTEVENT >> 3) + 1;
+        let mut mask_buf = vec![c_uchar::default(); mask_len as usize];
+        let mut mask = xinput2::XIEventMask {
+            deviceid: xinput2::XIAllDevices,
+            // https://github.com/freedesktop/xorg-xinput/blob/master/src/test_xi2.c#L377
+            // https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/include/X11/extensions/XI2.h#L184
+            mask_len: (xinput2::XI_LASTEVENT >> 3) + 1,
+            mask: mask_buf.as_mut_ptr(),
+        };
+        xinput2::XISetMask(mask_buf.as_mut_slice(), xinput2::XI_KeyPress);
+        xinput2::XISetMask(mask_buf.as_mut_slice(), xinput2::XI_KeyRelease);
+
+        xinput2::XISelectEvents(display, win, &mut mask as *mut _, 1);
+        xlib::XSync(display, 0);
+
+        KeyboardListener {
+            display,
+            window: win,
+            xi_opcode
+        }
+    }
+}
+
+fn name_to_keysym(name: &str) -> c_ulong {
+    let cstr = CString::new(name).unwrap();
+    let keysym = unsafe { xlib::XStringToKeysym(cstr.as_ptr()) };
+    if keysym == 0 {
+        panic!("\"{name}\" is not a valid keysym name");
+    }
+    keysym
+}
 
 fn parse_args() -> ArgMatches {
     let command = Command::new("multi_sink_source")
         .arg(Arg::new("node")
             .long("node")
-            .value_names(["NODE_NAME", "KEY"])
-            .help("see keycodes.rs for key names")
+            .value_names(["NODE_NAME", "KEYSYM"])
+            .help("KEYSYM is x11 keysym name (the #define without \"XK_\")")
             .required(true)
             .action(ArgAction::Append)
         );
@@ -60,12 +164,13 @@ fn main() {
         MUTE_POD = create_mute_pod(true);
         UNMUTE_POD = create_mute_pod(false);
     }
+    setup_keyboard_listener();
 
     let args = parse_args();
-    let pairs: Vec<(&str, Key)> = args.get_occurrences::<String>("node").unwrap()
+    let pairs: Vec<(&str, c_ulong)> = args.get_occurrences::<String>("node").unwrap()
         .map(|mut it| (
             it.next().unwrap().as_str(),
-            keycodes::string_to_key(it.next().unwrap().as_str()).expect("Invalid key name")
+            name_to_keysym(it.next().unwrap().as_str())
         ))
         .collect();
 
@@ -84,12 +189,12 @@ fn main() {
     let node_key = get_nodes(&registry, &core, &mainloop, &pairs[..]);
     println!("{:?}", node_key);
 
-    // moving is a bit unnecessary but rust is 1984
-    let callback = move |event: Event| {
-        let (key, mute) = match event.event_type {
-            rdev::EventType::KeyPress(key) => (key, true),
-            rdev::EventType::KeyRelease(key) => (key, false),
-            _ => return
+    let listener = setup_keyboard_listener();
+    loop {
+        let event = listener.next_event();
+        let (key, mute) = match event {
+            KeyEvent::Press(key) => (key, true),
+            KeyEvent::Release(key) => (key, false)
         };
         let mut change = false;
         for (node, k) in &node_key {
@@ -101,9 +206,6 @@ fn main() {
         if change {
             do_roundtrip(&mainloop, &core);
         }
-    };
-    if let Err(error) = listen(callback) {
-        panic!("{:?}", error);
     }
 }
 
@@ -124,7 +226,7 @@ fn set_mute(node: &pw::node::Node, mute: bool) {
     }
 }
 
-fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[(&str, Key)]) -> Vec<(pw::node::Node, Key)> {
+fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[(&str, c_ulong)]) -> Vec<(pw::node::Node, c_ulong)> {
     let mut out = Vec::new();
     for_each_object(registry, core, mainloop, |global| {
         if global.props.is_none() { return false }

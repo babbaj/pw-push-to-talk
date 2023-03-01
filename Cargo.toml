@@ -10,10 +10,8 @@ pipewire = "0.6"
 pipewire-sys = "0.6.0"
 libspa = "0.6.0"
 libspa-sys = "0.6.0"
-rdev = "0.5.2"
 clap = "4.1.6"
-#x11 = "2.21.0"
 
 [dependencies.x11]
 version = "2.21.0"
-features = ["xlib"]
+features = ["xlib", "xinput"]
