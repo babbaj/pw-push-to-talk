@@ -215,9 +215,6 @@ fn main() {
     let release_delay = args.get_one::<String>("release-delay").unwrap().parse::<u64>()
         .expect("failed to parse release-delay");
 
-    for s in &pairs {
-        println!("{:?}", s);
-    }
     // Initialize library and get the basic structures we need.
     pw::init();
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
@@ -233,7 +230,6 @@ fn main() {
         set_mute(&node.proxy, true);
     }
     do_roundtrip(&mainloop, &core);
-    println!("{:?}", node_key);
 
     let listener = setup_keyboard_listener();
     let mut key_states = HashMap::<u32, bool>::new();
