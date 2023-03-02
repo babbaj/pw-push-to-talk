@@ -3,6 +3,7 @@ extern crate core;
 use std::{cell::Cell, ptr, rc::Rc};
 use std::ffi::{c_char, c_int, c_uchar, c_ulong, CString};
 use std::io::Cursor;
+use std::time::Duration;
 
 use pipewire as pw;
 use pipewire::{Core, MainLoop, spa};
@@ -132,6 +133,12 @@ fn parse_args() -> ArgMatches {
             .help("KEYSYM is x11 keysym name (the #define without \"XK_\")")
             .required(true)
             .action(ArgAction::Append)
+        )
+        .arg(Arg::new("release-delay")
+            .long("release-delay")
+            .value_name("MILLIS")
+            .help("time to wait after releasing to mute")
+            .default_value("0")
         );
 
     command.get_matches()
@@ -164,7 +171,6 @@ fn main() {
         MUTE_POD = create_mute_pod(true);
         UNMUTE_POD = create_mute_pod(false);
     }
-    setup_keyboard_listener();
 
     let args = parse_args();
     let pairs: Vec<(&str, c_ulong)> = args.get_occurrences::<String>("node").unwrap()
@@ -173,6 +179,8 @@ fn main() {
             name_to_keysym(it.next().unwrap().as_str())
         ))
         .collect();
+    let release_delay = args.get_one::<String>("release-delay").unwrap().parse::<u64>()
+        .expect("failed to parse release-delay");
 
     for s in &pairs {
         println!("{:?}", s);
@@ -187,15 +195,24 @@ fn main() {
     let registry = core.get_registry().expect("Failed to get Registry");
 
     let node_key = get_nodes(&registry, &core, &mainloop, &pairs[..]);
+    // start with everything muted
+    for (node, _) in &node_key {
+        set_mute(node, true);
+    }
+    do_roundtrip(&mainloop, &core);
     println!("{:?}", node_key);
 
     let listener = setup_keyboard_listener();
     loop {
         let event = listener.next_event();
         let (key, mute) = match event {
-            KeyEvent::Press(key) => (key, true),
-            KeyEvent::Release(key) => (key, false)
+            // unmute on press, back to mute on release
+            KeyEvent::Press(key) => (key, false),
+            KeyEvent::Release(key) => (key, true)
         };
+        if mute && release_delay > 0 {
+            std::thread::sleep(Duration::from_millis(release_delay));
+        }
         let mut change = false;
         for (node, k) in &node_key {
             if *k == key {
@@ -239,8 +256,8 @@ fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[
                 }
             }
         }
-        // exit early if we found our nodes
-        out.len() >= name_key.len()
+
+        false
     });
 
     out
