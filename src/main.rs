@@ -234,7 +234,7 @@ fn main() {
     let listener = setup_keyboard_listener();
     let mut key_states = HashMap::<u32, bool>::new();
     for (node, _) in &node_key {
-        key_states.insert(node.global_id, false);
+        key_states.insert(node.global_id, true);
     }
     loop {
         let event = listener.next_event();
