@@ -245,7 +245,7 @@ fn main() {
                     set_mute(&node.proxy, mute);
                     change = true;
                 } else if event.type_ == KeyEventType::PRESS { // toggle
-                    let state = key_states.entry(node.global_id).or_insert(false);
+                    let state = key_states.entry(node.global_id).or_insert(true);
                     *state = !*state;
                     set_mute(&node.proxy, *state);
                     change = true;
