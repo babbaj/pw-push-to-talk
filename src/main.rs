@@ -1,17 +1,17 @@
-use std::{cell::Cell, ptr, rc::Rc};
+use std::{cell::Cell, ptr, rc::Rc, thread};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uchar, c_ulong, CString};
+use std::ffi::{c_char, c_int, c_uchar, c_ulong, CStr, CString};
 use std::io::Cursor;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pipewire as pw;
-use pipewire::{Core, MainLoop, spa};
-use pipewire::registry::{GlobalObject, Registry};
-use pipewire::spa::{ForeignDict};
+use pipewire::spa;
 use pw::prelude::*;
 use pw::types::ObjectType;
 use pipewire_sys as sys;
-// stupid macro
+// spa_interface_call_method! needs this
 use libspa_sys as spa_sys;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -33,6 +33,8 @@ struct Node {
     global_id: u32,
     proxy: pw::node::Node
 }
+
+unsafe impl Send for Node {}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum KeyType {
@@ -100,7 +102,6 @@ impl Drop for KeyboardListener {
         }
     }
 }
-
 
 fn setup_keyboard_listener() -> KeyboardListener {
     unsafe {
@@ -191,10 +192,10 @@ fn create_mute_pod(mute: bool) -> Vec<u8> {
 static mut MUTE_POD: Vec<u8> = Vec::new();
 static mut UNMUTE_POD: Vec<u8> = Vec::new();
 
-fn node_args<'a>(args: &'a ArgMatches, id: &str, type_: KeyType) -> Vec<(&'a str, (KeyType, c_ulong))> {
+fn node_args<'a>(args: &'a ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyType, c_ulong))> {
     if let Some(iter) = args.get_occurrences::<String>(id) {
         iter.map(|mut it| (
-            it.next().unwrap().as_str(),
+            it.next().unwrap().clone(),
             (type_, name_to_keysym(it.next().unwrap().as_str()))
         ))
             .collect()
@@ -222,37 +223,29 @@ fn main() {
     let core = context
         .connect(None)
         .expect("Failed to connect to PipeWire Core");
-    let registry = core.get_registry().expect("Failed to get Registry");
 
-    let node_key = get_nodes(&registry, &core, &mainloop, &pairs[..]);
-    println!("{:?}", node_key);
-    // start with everything muted
-    for (node, _) in &node_key {
-        set_mute(&node.proxy, true);
-    }
-    do_roundtrip(&mainloop, &core);
+    let nodes: Arc<Mutex<Vec<(Node, (KeyType, c_ulong))>>> = Arc::new(Mutex::new(Vec::new()));
+    let nodes_clone = nodes.clone();
+    let _listener_thread = thread::spawn(move || listen_for_nodes(pairs, nodes_clone));
 
     let listener = setup_keyboard_listener();
     let mut key_states = HashMap::<u32, bool>::new();
-    for (node, _) in &node_key {
-        key_states.insert(node.global_id, true);
-    }
     loop {
         let event = listener.next_event();
         let key = event.keysym;
         let mut change = false;
-        for (node, (key_type, k)) in &node_key {
+        for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
             if key == *k {
                 if *key_type == KeyType::HOLD {
                     // unmute on press, back to mute on release
                     let mute = event.type_ == KeyEventType::RELEASE;
                     if mute && release_delay > 0 {
-                        std::thread::sleep(Duration::from_millis(release_delay));
+                        thread::sleep(Duration::from_millis(release_delay));
                     }
                     set_mute(&node.proxy, mute);
                     change = true;
                 } else if event.type_ == KeyEventType::PRESS { // toggle
-                    let state = key_states.get_mut(&node.global_id).unwrap();
+                    let state = key_states.entry(node.global_id).or_insert(false);
                     *state = !*state;
                     set_mute(&node.proxy, *state);
                     change = true;
@@ -282,46 +275,49 @@ fn set_mute(node: &pw::node::Node, mute: bool) {
     }
 }
 
-fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[(&str, (KeyType, c_ulong))]) -> Vec<(Node, (KeyType, c_ulong))> {
-    let mut out = Vec::new();
-    for_each_object(registry, core, mainloop, |global| {
-        if global.props.is_none() { return false }
-        let props = global.props.as_ref().unwrap();
-        if global.type_ == ObjectType::Node {
+fn key_name(key: c_ulong) -> &'static str {
+    unsafe {
+        let raw = xlib::XKeysymToString(key);
+        CStr::from_ptr(raw).to_str().unwrap_or("unknown keysym")
+    }
+}
+
+fn listen_for_nodes(name_key: Vec<(String, (KeyType, c_ulong))>, out: Arc<Mutex<Vec<(Node, (KeyType, c_ulong))>>>) {
+    let mainloop = pw::MainLoop::new().expect("Failed to create MainLoop for listener thread");
+    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let core = context
+        .connect(None)
+        .expect("Failed to connect to PipeWire Core");
+    let registry = Rc::new(core.get_registry().expect("Failed to get Registry"));
+
+    let registry_clone = registry.clone();
+    let _listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            if global.props.is_none() { return }
+            let props = global.props.as_ref().unwrap();
+            if global.type_ != ObjectType::Node { return }
+
             if let Some(name) = props.get("node.name") {
                 name_key.iter().filter(|(name_in, _)| name == *name_in).for_each(|(_, key)| {
-                    let proxy = registry.bind(global).unwrap();
+                    let proxy = registry_clone.bind(global).unwrap();
                     let node = Node {
                         global_id: global.id,
                         proxy
                     };
-                    out.push((node, *key))
+                    println!("Found {name} with id {} for key {}", global.id, key_name(key.1));
+                    set_mute(&node.proxy, true);
+                    //dbg!(&node);
+                    let mut vec = out.lock().unwrap();
+                    vec.push((node, *key));
                 });
-            }
-        }
-
-        false
-    });
-
-    out
-}
-
-fn for_each_object<F: FnMut(&GlobalObject<ForeignDict>) -> bool>(registry: &Registry, core: &Core, mainloop: &MainLoop, callback: F) {
-    let mainloop_clone = mainloop.clone();
-    // the listener gets removed at the end of the function
-    let callback_ref: *mut () = unsafe { std::mem::transmute(&callback) };
-    let _reg_listener = registry
-        .add_listener_local()
-        .global(move |global| unsafe {
-            let troll: &mut F = std::mem::transmute(callback_ref);
-            if (*troll)(global) {
-                mainloop_clone.quit();
             }
         })
         .register();
 
-    do_roundtrip(&mainloop, &core);
+    mainloop.run();
 }
+
 
 /// Do a single roundtrip to process all events.
 /// See the example in roundtrip.rs for more details on this.
