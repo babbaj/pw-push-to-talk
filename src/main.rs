@@ -289,14 +289,14 @@ fn get_nodes(registry: &Registry, core: &Core, mainloop: &MainLoop, name_key: &[
         let props = global.props.as_ref().unwrap();
         if global.type_ == ObjectType::Node {
             if let Some(name) = props.get("node.name") {
-                if let Some((_, key)) = name_key.iter().find(|(name_in, _)| name == *name_in) {
+                name_key.iter().filter(|(name_in, _)| name == *name_in).for_each(|(_, key)| {
                     let proxy = registry.bind(global).unwrap();
                     let node = Node {
                         global_id: global.id,
                         proxy
                     };
                     out.push((node, *key))
-                }
+                });
             }
         }
 
