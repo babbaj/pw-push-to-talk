@@ -225,6 +225,7 @@ fn main() {
     let registry = core.get_registry().expect("Failed to get Registry");
 
     let node_key = get_nodes(&registry, &core, &mainloop, &pairs[..]);
+    println!("{:?}", node_key);
     // start with everything muted
     for (node, _) in &node_key {
         set_mute(&node.proxy, true);
