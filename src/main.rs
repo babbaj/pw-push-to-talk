@@ -192,13 +192,13 @@ fn create_mute_pod(mute: bool) -> Vec<u8> {
 static mut MUTE_POD: Vec<u8> = Vec::new();
 static mut UNMUTE_POD: Vec<u8> = Vec::new();
 
-fn node_args<'a>(args: &'a ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyType, c_ulong))> {
+fn node_args(args: &ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyType, c_ulong))> {
     if let Some(iter) = args.get_occurrences::<String>(id) {
         iter.map(|mut it| (
             it.next().unwrap().clone(),
             (type_, name_to_keysym(it.next().unwrap().as_str()))
         ))
-            .collect()
+        .collect()
     } else {
         Vec::new()
     }
