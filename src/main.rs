@@ -1,17 +1,13 @@
 use std::{cell::Cell, rc::Rc, thread};
 use std::collections::{HashMap};
-use std::ffi::{c_char, c_int, c_uchar, c_ulong, CStr, CString};
 use std::fmt::Debug;
 use std::io::Cursor;
-use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::ops::{Deref};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 
 use pipewire as pw;
-use pipewire::{Core, MainLoop, spa};
 use pw::prelude::*;
 use pw::types::ObjectType;
 use pipewire_sys as sys;
@@ -23,9 +19,18 @@ use libspa::pod::{Object, Property, PropertyFlags, Value};
 use libspa::pod::serialize::PodSerializer;
 use pipewire::proxy::ProxyT;
 
+use evdev::Key;
 
-use evdev::{Device, enumerate, InputEventKind, Key};
+use input::{Event, Libinput, LibinputInterface};
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
+use std::path::Path;
+use input::event::keyboard::{KeyboardEventTrait, KeyState};
+use nix::poll::{poll, PollFlags, PollFd};
 
+extern crate libc;
+use libc::{O_RDONLY, O_RDWR, O_WRONLY};
 
 #[derive(Debug)]
 struct Node {
@@ -97,54 +102,35 @@ fn node_args(args: &ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyTy
     }
 }
 
-fn supports_keys(dev: &evdev::Device) -> bool {
-    dev.supported_keys()
-        .map(|attrs| attrs.contains(evdev::Key(evdev::Key::KEY_F1.code())))
-        .unwrap_or(false)
-}
-
-fn get_keyboards() -> Vec<(PathBuf, Device)> {
-    return evdev::enumerate()
-        .filter(|(_, dev)| supports_keys(dev))
-        .collect()
-}
-
-fn event_loop(mut dev: Device, path: PathBuf, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
+fn event_loop(mut input: Libinput, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
     let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
     let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
         .connect(None)
         .expect("Failed to connect to PipeWire Core");
-    let dev_name = String::from(dev.name().unwrap_or(dev.physical_path().unwrap_or("unknown name")));
 
     let mut key_states = HashMap::<u32, bool>::new();
-    loop {
-        let events = dev.fetch_events();
-        if let Err(err) = &events {
-            if let Some(libc::ENODEV) = err.raw_os_error() {
-                // device was removed
-                return;
-            }
-            panic!("Unexpected error fetching events from \"{}\"({}), {}", dev_name, path.display(), err);
-        }
-        for event in events.unwrap() {
-            if let InputEventKind::Key(event_key) = event.kind() {
-                dbg!(event.value(), event_key);
+    // example code broke
+    let fd = unsafe { BorrowedFd::borrow_raw(input.as_raw_fd()) };
+    let pollfd = PollFd::new(&fd, PollFlags::POLLIN);
+    while poll(&mut [pollfd], -1).is_ok() {
+        input.dispatch().unwrap();
+        for event in &mut input {
+            if let Event::Keyboard(kb_event) = event {
+                let state = kb_event.key_state();
+                let event_key = Key::new(kb_event.key() as u16);
+
                 let mut change = false;
                 for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
                     if event_key == *k {
                         if *key_type == KeyType::HOLD {
-                            let mute = match event.value() {
-                                0 => true, // release
-                                1 => false, // down
-                                _ => continue
-                            };
+                            let mute = state == KeyState::Released;
                             if mute && release_delay > 0 {
                                 thread::sleep(Duration::from_millis(release_delay));
                             }
                             set_mute(&node.proxy, mute);
                             change = true;
-                        } else if event.value() == 1 { // toggle and key down
+                        } else if state == KeyState::Pressed { // toggle and key down
                             let state = key_states.entry(node.global_id).or_insert(true);
                             *state = !*state;
                             set_mute(&node.proxy, *state);
@@ -160,6 +146,23 @@ fn event_loop(mut dev: Device, path: PathBuf, release_delay: u64, nodes: Arc<Mut
     }
 }
 
+struct Interface;
+
+// pasted example code
+impl LibinputInterface for Interface {
+    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
+        OpenOptions::new()
+            .custom_flags(flags)
+            .read((flags & O_RDONLY != 0) | (flags & O_RDWR != 0))
+            .write((flags & O_WRONLY != 0) | (flags & O_RDWR != 0))
+            .open(path)
+            .map(|file| file.into())
+            .map_err(|err| err.raw_os_error().unwrap())
+    }
+    fn close_restricted(&mut self, fd: OwnedFd) {
+        drop(File::from(fd));
+    }
+}
 
 fn main() {
     unsafe {
@@ -180,28 +183,10 @@ fn main() {
     let nodes_clone = nodes.clone();
     let _listener_thread = thread::spawn(move || listen_for_nodes(pairs, nodes_clone));
 
-
-    let mut threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    for (path, mut dev) in evdev::enumerate() {
-        if !supports_keys(&mut dev) {
-            continue;
-        }
-        println!("{} {}", path.display(), dev.physical_path().unwrap());
-        let nodes2 = nodes.clone();
-        threads.lock().unwrap().push(thread::spawn(move || {
-            event_loop(dev, path, release_delay, nodes2);
-        }));
-    }
-    loop {
-        let mut guard = threads.lock().unwrap();
-        let handle = guard.pop();
-        if let Some(h) = handle {
-            drop(guard);
-            h.join().unwrap();
-        } else {
-            return;
-        }
-    }
+    let nodes2 = nodes.clone();
+    let mut input = Libinput::new_with_udev(Interface);
+    input.udev_assign_seat("seat0").unwrap();
+    event_loop(input, release_delay, nodes2);
 }
 
 // requires call to do_roundtrip
@@ -210,7 +195,7 @@ fn set_mute(node: &pw::node::Node, mute: bool) {
         let pod = if mute { &MUTE_POD } else { &UNMUTE_POD };
 
         let ptr: &*mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
-        spa::spa_interface_call_method!(
+        pw::spa::spa_interface_call_method!(
             *ptr,
             sys::pw_node_methods,
             set_param,

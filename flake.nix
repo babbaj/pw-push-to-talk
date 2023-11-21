@@ -1,7 +1,7 @@
 {
   description = "A very basic flake";
 
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/22.11";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
   let
@@ -15,11 +15,9 @@
     in pkgs.mkShell rec {
       LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/libclang.so";
       packages = with pkgs; [
-        pkgconfig
+        pkg-config
         pipewire.dev
-        xorg.libX11.dev
-        xorg.libXi.dev
-        xorg.libXtst
+        libinput.dev
       ];
     };
   };
