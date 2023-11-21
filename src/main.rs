@@ -215,6 +215,7 @@ fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<
     let registry = Rc::new(core.get_registry().expect("Failed to get Registry"));
 
     let registry_clone = registry.clone();
+    let vec_copy = out.clone();
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -236,6 +237,9 @@ fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<
                     vec.push((node, *key));
                 });
             }
+        })
+        .global_remove(move |id| {
+            vec_copy.lock().unwrap().retain(|(node, _)| node.global_id != id);
         })
         .register();
 
