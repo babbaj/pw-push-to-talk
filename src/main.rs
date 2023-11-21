@@ -1,13 +1,17 @@
-use std::{cell::Cell, ptr, rc::Rc, thread};
-use std::collections::HashMap;
+use std::{cell::Cell, rc::Rc, thread};
+use std::collections::{HashMap};
 use std::ffi::{c_char, c_int, c_uchar, c_ulong, CStr, CString};
+use std::fmt::Debug;
 use std::io::Cursor;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 
 use pipewire as pw;
-use pipewire::spa;
+use pipewire::{Core, MainLoop, spa};
 use pw::prelude::*;
 use pw::types::ObjectType;
 use pipewire_sys as sys;
@@ -19,14 +23,9 @@ use libspa::pod::{Object, Property, PropertyFlags, Value};
 use libspa::pod::serialize::PodSerializer;
 use pipewire::proxy::ProxyT;
 
-use x11::xlib;
-use x11::xinput2;
 
-struct KeyboardListener {
-    display: *mut xlib::Display,
-    window: c_ulong,
-    xi_opcode: c_int
-}
+use evdev::{Device, enumerate, InputEventKind, Key};
+
 
 #[derive(Debug)]
 struct Node {
@@ -42,117 +41,11 @@ enum KeyType {
     TOGGLE
 }
 
-#[derive(Debug, PartialEq)]
-enum KeyEventType {
-    PRESS,
-    RELEASE
-}
-
-// keysym
-#[derive(Debug)]
-struct KeyEvent {
-    type_: KeyEventType,
-    keysym: c_ulong
-}
-
-impl KeyboardListener {
-    fn next_event(&self) -> KeyEvent {
-        unsafe {
-            loop {
-                let mut event: xlib::XEvent = std::mem::zeroed();
-                xlib::XNextEvent(self.display, &mut event as *mut _);
-                let cookie = &mut event.generic_event_cookie;
-
-                if xlib::XGetEventData(self.display, cookie as *mut _) != 0
-                    && cookie.type_ == xlib::GenericEvent
-                    && cookie.extension == self.xi_opcode
-                {
-                    // should always be true
-                    if cookie.evtype == xinput2::XI_KeyPress || cookie.evtype == xinput2::XI_KeyRelease {
-                        let event = &*(cookie.data as *const xinput2::XIDeviceEvent);
-                        let repeat = event.flags & xinput2::XIKeyRepeat != 0;
-                        if repeat { continue }
-                        let keycode = event.detail;
-
-                        let keysym = xlib::XKeycodeToKeysym(self.display, keycode as c_uchar, 0);
-                        let type_ = match cookie.evtype {
-                            xinput2::XI_KeyPress => KeyEventType::PRESS,
-                            xinput2::XI_KeyRelease => KeyEventType::RELEASE,
-                            _ => panic!()
-                        };
-
-                        xlib::XFreeEventData(self.display, cookie as *mut _);
-                        return KeyEvent {
-                            type_,
-                            keysym,
-                        }
-                    }
-                }
-                xlib::XFreeEventData(self.display, cookie as *mut _)
-            }
-        }
-    }
-}
-
-impl Drop for KeyboardListener {
-    fn drop(&mut self) {
-        unsafe {
-            xlib::XDestroyWindow(self.display, self.window);
-            xlib::XCloseDisplay(self.display);
-        }
-    }
-}
-
-fn setup_keyboard_listener() -> KeyboardListener {
-    unsafe {
-        let display = xlib::XOpenDisplay(ptr::null());
-        // https://github.com/freedesktop/xorg-xinput/blob/8cebd89a644545c91a3d1c146977fe023798ee2a/src/xinput.c#L415
-        let mut xi_opcode: c_int = 0;
-        // don't need these
-        let mut _event: c_int = 0;
-        let mut _error: c_int = 0;
-        if xlib::XQueryExtension(display, "XInputExtension\0".as_ptr() as *const c_char, &mut xi_opcode as *mut _, &mut _event as *mut _, &mut _error as *mut _) == 0 {
-            panic!("X Input extension not available")
-        }
-
-        let win = xlib::XDefaultRootWindow(display);
-        let mask_len = (xinput2::XI_LASTEVENT >> 3) + 1;
-        let mut mask_buf = vec![c_uchar::default(); mask_len as usize];
-        let mut mask = xinput2::XIEventMask {
-            deviceid: xinput2::XIAllDevices,
-            // https://github.com/freedesktop/xorg-xinput/blob/master/src/test_xi2.c#L377
-            // https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/include/X11/extensions/XI2.h#L184
-            mask_len: (xinput2::XI_LASTEVENT >> 3) + 1,
-            mask: mask_buf.as_mut_ptr(),
-        };
-        xinput2::XISetMask(mask_buf.as_mut_slice(), xinput2::XI_KeyPress);
-        xinput2::XISetMask(mask_buf.as_mut_slice(), xinput2::XI_KeyRelease);
-
-        xinput2::XISelectEvents(display, win, &mut mask as *mut _, 1);
-        xlib::XSync(display, 0);
-
-        KeyboardListener {
-            display,
-            window: win,
-            xi_opcode
-        }
-    }
-}
-
-fn name_to_keysym(name: &str) -> c_ulong {
-    let cstr = CString::new(name).unwrap();
-    let keysym = unsafe { xlib::XStringToKeysym(cstr.as_ptr()) };
-    if keysym == 0 {
-        panic!("\"{name}\" is not a valid keysym name");
-    }
-    keysym
-}
-
 fn parse_args() -> ArgMatches {
     let node_arg = Arg::new("node")
         .long("node")
-        .value_names(["NODE_NAME", "KEYSYM"])
-        .help("KEYSYM is x11 keysym name (the #define without \"XK_\")")
+        .value_names(["NODE_NAME", "EVENT_CODE"])
+        .help("EVENT_CODE is the linux #define from input-event-codes.h")
         .action(ArgAction::Append);
     let toggle_node_arg = node_arg.clone()
         .id("node-toggle")
@@ -192,17 +85,81 @@ fn create_mute_pod(mute: bool) -> Vec<u8> {
 static mut MUTE_POD: Vec<u8> = Vec::new();
 static mut UNMUTE_POD: Vec<u8> = Vec::new();
 
-fn node_args(args: &ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyType, c_ulong))> {
+fn node_args(args: &ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyType, Key))> {
     if let Some(iter) = args.get_occurrences::<String>(id) {
         iter.map(|mut it| (
             it.next().unwrap().clone(),
-            (type_, name_to_keysym(it.next().unwrap().as_str()))
+            (type_, Key::from_str(it.next().unwrap().as_str()).unwrap())
         ))
         .collect()
     } else {
         Vec::new()
     }
 }
+
+fn supports_keys(dev: &evdev::Device) -> bool {
+    dev.supported_keys()
+        .map(|attrs| attrs.contains(evdev::Key(evdev::Key::KEY_F1.code())))
+        .unwrap_or(false)
+}
+
+fn get_keyboards() -> Vec<(PathBuf, Device)> {
+    return evdev::enumerate()
+        .filter(|(_, dev)| supports_keys(dev))
+        .collect()
+}
+
+fn event_loop(mut dev: Device, path: PathBuf, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
+    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
+    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let core = context
+        .connect(None)
+        .expect("Failed to connect to PipeWire Core");
+    let dev_name = String::from(dev.name().unwrap_or(dev.physical_path().unwrap_or("unknown name")));
+
+    let mut key_states = HashMap::<u32, bool>::new();
+    loop {
+        let events = dev.fetch_events();
+        if let Err(err) = &events {
+            if let Some(libc::ENODEV) = err.raw_os_error() {
+                // device was removed
+                return;
+            }
+            panic!("Unexpected error fetching events from \"{}\"({}), {}", dev_name, path.display(), err);
+        }
+        for event in events.unwrap() {
+            if let InputEventKind::Key(event_key) = event.kind() {
+                dbg!(event.value(), event_key);
+                let mut change = false;
+                for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
+                    if event_key == *k {
+                        if *key_type == KeyType::HOLD {
+                            let mute = match event.value() {
+                                0 => true, // release
+                                1 => false, // down
+                                _ => continue
+                            };
+                            if mute && release_delay > 0 {
+                                thread::sleep(Duration::from_millis(release_delay));
+                            }
+                            set_mute(&node.proxy, mute);
+                            change = true;
+                        } else if event.value() == 1 { // toggle and key down
+                            let state = key_states.entry(node.global_id).or_insert(true);
+                            *state = !*state;
+                            set_mute(&node.proxy, *state);
+                            change = true;
+                        }
+                    }
+                }
+                if change {
+                    do_roundtrip(&mainloop, &core);
+                }
+            }
+        }
+    }
+}
+
 
 fn main() {
     unsafe {
@@ -218,42 +175,31 @@ fn main() {
 
     // Initialize library and get the basic structures we need.
     pw::init();
-    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
-    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
-    let core = context
-        .connect(None)
-        .expect("Failed to connect to PipeWire Core");
 
-    let nodes: Arc<Mutex<Vec<(Node, (KeyType, c_ulong))>>> = Arc::new(Mutex::new(Vec::new()));
+    let nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>> = Arc::new(Mutex::new(Vec::new()));
     let nodes_clone = nodes.clone();
     let _listener_thread = thread::spawn(move || listen_for_nodes(pairs, nodes_clone));
 
-    let listener = setup_keyboard_listener();
-    let mut key_states = HashMap::<u32, bool>::new();
-    loop {
-        let event = listener.next_event();
-        let key = event.keysym;
-        let mut change = false;
-        for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
-            if key == *k {
-                if *key_type == KeyType::HOLD {
-                    // unmute on press, back to mute on release
-                    let mute = event.type_ == KeyEventType::RELEASE;
-                    if mute && release_delay > 0 {
-                        thread::sleep(Duration::from_millis(release_delay));
-                    }
-                    set_mute(&node.proxy, mute);
-                    change = true;
-                } else if event.type_ == KeyEventType::PRESS { // toggle
-                    let state = key_states.entry(node.global_id).or_insert(true);
-                    *state = !*state;
-                    set_mute(&node.proxy, *state);
-                    change = true;
-                }
-            }
+
+    let mut threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    for (path, mut dev) in evdev::enumerate() {
+        if !supports_keys(&mut dev) {
+            continue;
         }
-        if change {
-            do_roundtrip(&mainloop, &core);
+        println!("{} {}", path.display(), dev.physical_path().unwrap());
+        let nodes2 = nodes.clone();
+        threads.lock().unwrap().push(thread::spawn(move || {
+            event_loop(dev, path, release_delay, nodes2);
+        }));
+    }
+    loop {
+        let mut guard = threads.lock().unwrap();
+        let handle = guard.pop();
+        if let Some(h) = handle {
+            drop(guard);
+            h.join().unwrap();
+        } else {
+            return;
         }
     }
 }
@@ -275,14 +221,7 @@ fn set_mute(node: &pw::node::Node, mute: bool) {
     }
 }
 
-fn key_name(key: c_ulong) -> &'static str {
-    unsafe {
-        let raw = xlib::XKeysymToString(key);
-        CStr::from_ptr(raw).to_str().unwrap_or("unknown keysym")
-    }
-}
-
-fn listen_for_nodes(name_key: Vec<(String, (KeyType, c_ulong))>, out: Arc<Mutex<Vec<(Node, (KeyType, c_ulong))>>>) {
+fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
     let mainloop = pw::MainLoop::new().expect("Failed to create MainLoop for listener thread");
     let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
@@ -305,7 +244,7 @@ fn listen_for_nodes(name_key: Vec<(String, (KeyType, c_ulong))>, out: Arc<Mutex<
                         global_id: global.id,
                         proxy
                     };
-                    println!("Found {name} with id {} for key {}", global.id, key_name(key.1));
+                    println!("Found {name} with id {} for key {:?}", global.id, key.1);
                     set_mute(&node.proxy, true);
                     //dbg!(&node);
                     let mut vec = out.lock().unwrap();
