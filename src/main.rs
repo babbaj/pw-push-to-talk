@@ -208,16 +208,16 @@ fn main() {
 // requires call to do_roundtrip
 fn set_mute(node: &pw::node::Node, mute: bool) {
     unsafe {
-        let pod = if mute { &*addr_of!(MUTE_POD) } else { &*addr_of!(UNMUTE_POD) };
+        let pod = if mute { addr_of!(MUTE_POD) } else { addr_of!(UNMUTE_POD) };
 
-        let ptr: &*mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
+        let ptr: *mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
         pw::spa::spa_interface_call_method!(
-            *ptr,
+            ptr,
             sys::pw_node_methods,
             set_param,
             spa_sys::SPA_PARAM_Props,
             0,
-            pod.as_ptr() as *const spa_sys::spa_pod
+            pod as *const spa_sys::spa_pod
         );
     }
 }
