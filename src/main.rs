@@ -26,6 +26,8 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::{fs::OpenOptionsExt, io::OwnedFd};
 use std::path::Path;
+use std::ptr::addr_of;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use input::event::keyboard::{KeyboardEventTrait, KeyState};
 use nix::poll::{poll, PollFlags, PollFd};
 
@@ -44,6 +46,11 @@ unsafe impl Send for Node {}
 enum KeyType {
     HOLD,
     TOGGLE
+}
+
+struct KeyEvent {
+    state: KeyState,
+    key: Key
 }
 
 fn parse_args() -> ArgMatches {
@@ -102,14 +109,7 @@ fn node_args(args: &ArgMatches, id: &str, type_: KeyType) -> Vec<(String, (KeyTy
     }
 }
 
-fn event_loop(mut input: Libinput, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
-    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
-    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
-    let core = context
-        .connect(None)
-        .expect("Failed to connect to PipeWire Core");
-
-    let mut key_states = HashMap::<u32, bool>::new();
+fn key_loop(mut input: Libinput, tx: Sender<KeyEvent>) {
     // example code broke
     let fd = unsafe { BorrowedFd::borrow_raw(input.as_raw_fd()) };
     let pollfd = PollFd::new(&fd, PollFlags::POLLIN);
@@ -118,30 +118,42 @@ fn event_loop(mut input: Libinput, release_delay: u64, nodes: Arc<Mutex<Vec<(Nod
         for event in &mut input {
             if let Event::Keyboard(kb_event) = event {
                 let state = kb_event.key_state();
-                let event_key = Key::new(kb_event.key() as u16);
+                let key = Key::new(kb_event.key() as u16);
+                tx.send(KeyEvent{ state, key}).unwrap();
+            }
+        }
+    }
+}
 
-                let mut change = false;
-                for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
-                    if event_key == *k {
-                        if *key_type == KeyType::HOLD {
-                            let mute = state == KeyState::Released;
-                            if mute && release_delay > 0 {
-                                thread::sleep(Duration::from_millis(release_delay));
-                            }
-                            set_mute(&node.proxy, mute);
-                            change = true;
-                        } else if state == KeyState::Pressed { // toggle and key down
-                            let state = key_states.entry(node.global_id).or_insert(true);
-                            *state = !*state;
-                            set_mute(&node.proxy, *state);
-                            change = true;
-                        }
+fn event_loop(receiver: Receiver<KeyEvent>, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
+    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
+    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let core = context
+        .connect(None)
+        .expect("Failed to connect to PipeWire Core");
+
+    let mut key_states = HashMap::<u32, bool>::new();
+    for KeyEvent{ state, key} in receiver {
+        let mut change = false;
+        for (node, (key_type, k)) in nodes.lock().unwrap().deref() {
+            if key == *k {
+                if *key_type == KeyType::HOLD {
+                    let mute = state == KeyState::Released;
+                    if mute && release_delay > 0 {
+                        thread::sleep(Duration::from_millis(release_delay));
                     }
-                }
-                if change {
-                    do_roundtrip(&mainloop, &core);
+                    set_mute(&node.proxy, mute);
+                    change = true;
+                } else if state == KeyState::Pressed { // toggle and key down
+                    let state = key_states.entry(node.global_id).or_insert(true);
+                    *state = !*state;
+                    set_mute(&node.proxy, *state);
+                    change = true;
                 }
             }
+        }
+        if change {
+            do_roundtrip(&mainloop, &core);
         }
     }
 }
@@ -184,15 +196,19 @@ fn main() {
     let _listener_thread = thread::spawn(move || listen_for_nodes(pairs, nodes_clone));
 
     let nodes2 = nodes.clone();
-    let mut input = Libinput::new_with_udev(Interface);
-    input.udev_assign_seat("seat0").unwrap();
-    event_loop(input, release_delay, nodes2);
+    let (tx, rx) = channel();
+    let _jh = thread::spawn(|| {
+        let mut input = Libinput::new_with_udev(Interface);
+        input.udev_assign_seat("seat0").unwrap();
+        key_loop(input, tx);
+    });
+    event_loop(rx, release_delay, nodes2);
 }
 
 // requires call to do_roundtrip
 fn set_mute(node: &pw::node::Node, mute: bool) {
     unsafe {
-        let pod = if mute { &MUTE_POD } else { &UNMUTE_POD };
+        let pod = if mute { &*addr_of!(MUTE_POD) } else { &*addr_of!(UNMUTE_POD) };
 
         let ptr: &*mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
         pw::spa::spa_interface_call_method!(
@@ -231,8 +247,9 @@ fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<
                         proxy
                     };
                     println!("Found {name} with id {} for key {:?}", global.id, key.1);
-                    set_mute(&node.proxy, true);
-                    //dbg!(&node);
+                    if key.0 == KeyType::HOLD {
+                        set_mute(&node.proxy, true);
+                    }
                     let mut vec = out.lock().unwrap();
                     vec.push((node, *key));
                 });
