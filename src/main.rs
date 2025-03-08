@@ -207,10 +207,11 @@ fn main() {
 
 // requires call to do_roundtrip
 fn set_mute(node: &pw::node::Node, mute: bool) {
-    unsafe {
-        let pod = if mute { addr_of!(MUTE_POD) } else { addr_of!(UNMUTE_POD) };
-        node.set_param(libspa::param::ParamType::Props, 0, Pod::from_bytes(&**pod).unwrap());
-    }
+    let pod = unsafe {
+        let data = if mute { addr_of!(MUTE_POD) } else { addr_of!(UNMUTE_POD) };
+        Pod::from_bytes(&**data).unwrap()
+    };
+    node.set_param(libspa::param::ParamType::Props, 0, pod);
 }
 
 fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
