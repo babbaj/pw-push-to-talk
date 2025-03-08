@@ -15,7 +15,7 @@ use pipewire_sys as sys;
 use libspa_sys as spa_sys;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use libspa::pod::{Object, Property, PropertyFlags, Value};
+use libspa::pod::{Object, Pod, Property, PropertyFlags, Value};
 use libspa::pod::serialize::PodSerializer;
 use pipewire::proxy::ProxyT;
 
@@ -126,8 +126,8 @@ fn key_loop(mut input: Libinput, tx: Sender<KeyEvent>) {
 }
 
 fn event_loop(receiver: Receiver<KeyEvent>, release_delay: u64, nodes: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
-    let mainloop = pw::MainLoop::new().expect("Failed to create PipeWire Mainloop");
-    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let mainloop = pw::main_loop::MainLoop::new(None).expect("Failed to create PipeWire Mainloop");
+    let context = pw::context::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
         .connect(None)
         .expect("Failed to connect to PipeWire Core");
@@ -209,22 +209,13 @@ fn main() {
 fn set_mute(node: &pw::node::Node, mute: bool) {
     unsafe {
         let pod = if mute { addr_of!(MUTE_POD) } else { addr_of!(UNMUTE_POD) };
-
-        let ptr: *mut sys::pw_proxy = std::mem::transmute(node.upcast_ref());
-        pw::spa::spa_interface_call_method!(
-            ptr,
-            sys::pw_node_methods,
-            set_param,
-            spa_sys::SPA_PARAM_Props,
-            0,
-            pod as *const spa_sys::spa_pod
-        );
+        node.set_param(libspa::param::ParamType::Props, 0, Pod::from_bytes(&**pod).unwrap());
     }
 }
 
 fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<(Node, (KeyType, Key))>>>) {
-    let mainloop = pw::MainLoop::new().expect("Failed to create MainLoop for listener thread");
-    let context = pw::Context::new(&mainloop).expect("Failed to create PipeWire Context");
+    let mainloop = pw::main_loop::MainLoop::new(None).expect("Failed to create MainLoop for listener thread");
+    let context = pw::context::Context::new(&mainloop).expect("Failed to create PipeWire Context");
     let core = context
         .connect(None)
         .expect("Failed to connect to PipeWire Core");
@@ -266,7 +257,7 @@ fn listen_for_nodes(name_key: Vec<(String, (KeyType, Key))>, out: Arc<Mutex<Vec<
 
 /// Do a single roundtrip to process all events.
 /// See the example in roundtrip.rs for more details on this.
-fn do_roundtrip(mainloop: &pw::MainLoop, core: &pw::Core) {
+fn do_roundtrip(mainloop: &pw::main_loop::MainLoop, core: &pw::core::Core) {
     let done = Rc::new(Cell::new(false));
     let done_clone = done.clone();
     let loop_clone = mainloop.clone();
@@ -278,7 +269,7 @@ fn do_roundtrip(mainloop: &pw::MainLoop, core: &pw::Core) {
     let _listener_core = core
         .add_listener_local()
         .done(move |id, seq| {
-            if id == pw::PW_ID_CORE && seq == pending {
+            if id == pw::core::PW_ID_CORE && seq == pending {
                 done_clone.set(true);
                 loop_clone.quit();
             }
